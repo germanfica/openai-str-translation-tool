@@ -92,6 +92,9 @@ _TRANSLATOR_SYS_PROMPT = (
     "Devolvé solo el texto traducido, sin comillas ni comentarios. "
     "Respetá exactamente los placeholders (por ej. __PH_0__, %s, {0}, $NAME$, etiquetas <b>...</b>, secuencias \\n). "
     "No agregues ni quites espacios alrededor de placeholders. "
+    "Si el texto tiene varios renglones, devolvé la misma cantidad de renglones y en el mismo orden. "
+    "No elimines guiones de diálogo al inicio de línea. "
+    "Usá signos de apertura ¿ y ¡ cuando corresponda. "
     "Usá español latino neutro, claro y natural."
 )
 
@@ -121,6 +124,13 @@ def translate_segment(client: OpenAI, model: str, text_en: str) -> str:
             time.sleep(delay)
             delay = min(delay * 2, 8.0)
     return text_en
+
+# helper: traducir un bloque completo preservando cantidad de saltos de línea
+def translate_block_preserving_newlines(client: OpenAI, model: str, lines: List[str]) -> List[str]:
+    joined = '\n'.join(lines)
+    translated = translate_segment(client, model, joined)
+    out_lines = translated.split('\n')
+    return out_lines
 
 # ====================== Detección de formato ======================
 
@@ -343,21 +353,40 @@ def process_srt_file(text: str, newline: str, client: OpenAI, model: str,
                      save_map: Optional[str], show_progress: bool,
                      show_preview: bool = False) -> Tuple[str, List[Dict]]:
     blocks = parse_srt(text)
-    segments: List[Tuple[int, int, str]] = []  # (block_idx, line_idx, text)
 
+    # primero contamos cuantos bloques requieren traducción para la barra
+    translatable_block_idxs: List[int] = []
     for bi, b in enumerate(blocks):
-        for li, line in enumerate(b.text_lines):
-            if line.strip() and should_translate(line):
-                segments.append((bi, li, line))
+        if any(line.strip() and should_translate(line) for line in b.text_lines):
+            translatable_block_idxs.append(bi)
 
-    total = len(segments)
+    total = len(translatable_block_idxs)
     mapping_out: List[Dict] = []
     done = 0
 
-    for bi, li, src in segments:
-        tgt = translate_segment(client, model, src)
-        blocks[bi].text_lines[li] = tgt
-        mapping_out.append({'type': 'srt', 'block': bi, 'line': li, 'source': src, 'translated': tgt})
+    for bi in translatable_block_idxs:
+        b = blocks[bi]
+
+        # intento 1: traducir el bloque completo preservando saltos
+        try_block = translate_block_preserving_newlines(client, model, b.text_lines)
+        if len(try_block) == len(b.text_lines):
+            new_lines = try_block
+        else:
+            # fallback: línea por línea solo donde haga falta
+            new_lines = []
+            for li, src in enumerate(b.text_lines):
+                if src.strip() and should_translate(src):
+                    new_lines.append(translate_segment(client, model, src))
+                else:
+                    new_lines.append(src)
+
+        # guardar mapping por línea
+        for li, (src, tgt) in enumerate(zip(b.text_lines, new_lines)):
+            mapping_out.append({'type': 'srt', 'block': bi, 'line': li, 'source': src, 'translated': tgt})
+
+        # reinyectar
+        blocks[bi].text_lines = new_lines
+
         done += 1
         if show_progress:
             print_progress(done, total)
