@@ -274,6 +274,12 @@ def render_srt(blocks: List[SrtBlock], newline: str = '\n') -> str:
     # quitar un newline extra final si quedó doble
     return text.rstrip('\r\n') + newline
 
+def _render_srt_block(block: SrtBlock, newline: str) -> str:
+    parts: List[str] = [str(block.index), f'{block.start} --> {block.end}']
+    parts.extend(block.text_lines if block.text_lines else [''])
+    parts.append('')  # separador de bloque
+    return newline.join(parts)
+
 # ====================== Progreso ======================
 
 def print_progress(i: int, total: int):
@@ -293,7 +299,8 @@ def should_translate(line: str) -> bool:
     return has_ascii_letters
 
 def process_str_file(text: str, newline: str, client: OpenAI, model: str,
-                     save_map: Optional[str], show_progress: bool) -> Tuple[str, List[Dict]]:
+                     save_map: Optional[str], show_progress: bool,
+                     show_preview: bool = False) -> Tuple[str, List[Dict]]:
     parsed = parse_str(text)
 
     # construir lista de segmentos a traducir
@@ -319,6 +326,13 @@ def process_str_file(text: str, newline: str, client: OpenAI, model: str,
         if show_progress:
             print_progress(done, total)
 
+        if show_preview:
+            v_escaped = tgt.replace('"', '\\"')
+            preview_line = f'{obj.key} = "{v_escaped}"'
+            if obj.trailing_comment:
+                preview_line += ' ' + obj.trailing_comment
+            print(preview_line, flush=True)
+
     if save_map:
         with open(save_map, 'w', encoding='utf-8') as f:
             json.dump(mapping_out, f, ensure_ascii=False, indent=2)
@@ -326,7 +340,8 @@ def process_str_file(text: str, newline: str, client: OpenAI, model: str,
     return render_str(parsed, newline=newline), mapping_out
 
 def process_srt_file(text: str, newline: str, client: OpenAI, model: str,
-                     save_map: Optional[str], show_progress: bool) -> Tuple[str, List[Dict]]:
+                     save_map: Optional[str], show_progress: bool,
+                     show_preview: bool = False) -> Tuple[str, List[Dict]]:
     blocks = parse_srt(text)
     segments: List[Tuple[int, int, str]] = []  # (block_idx, line_idx, text)
 
@@ -347,6 +362,10 @@ def process_srt_file(text: str, newline: str, client: OpenAI, model: str,
         if show_progress:
             print_progress(done, total)
 
+        if show_preview:
+            preview_text = _render_srt_block(blocks[bi], newline)
+            print(preview_text, end='', flush=True)
+
     if save_map:
         with open(save_map, 'w', encoding='utf-8') as f:
             json.dump(mapping_out, f, ensure_ascii=False, indent=2)
@@ -354,7 +373,8 @@ def process_srt_file(text: str, newline: str, client: OpenAI, model: str,
     return render_srt(blocks, newline=newline), mapping_out
 
 def process_file(in_path: str, out_suffix: str, dry_run: bool, model: str, api_key: Optional[str],
-                 force_format: str, save_map: Optional[str], show_progress: bool) -> str:
+                 force_format: str, save_map: Optional[str], show_progress: bool,
+                 show_preview: bool) -> str:
     text, had_bom, newline = _read_text_keep_bom(in_path)
     fmt = detect_format(text) if force_format == 'auto' else force_format.lower()
     client = get_client(api_key)
@@ -363,14 +383,14 @@ def process_file(in_path: str, out_suffix: str, dry_run: bool, model: str, api_k
         raise ValueError("Formato inválido. Usá --format auto|str|srt")
 
     if fmt == 'srt' or (fmt == 'auto' and detect_format(text) == 'srt'):
-        out_text, _ = process_srt_file(text, newline, client, model, save_map, show_progress)
+        out_text, _ = process_srt_file(text, newline, client, model, save_map, show_progress, show_preview)
         out_path = _derive_out_path(in_path, out_suffix, forced_ext='.srt')
     else:
-        out_text, _ = process_str_file(text, newline, client, model, save_map, show_progress)
+        out_text, _ = process_str_file(text, newline, client, model, save_map, show_progress, show_preview)
         out_path = _derive_out_path(in_path, out_suffix, forced_ext=None)
 
     if dry_run:
-        print(out_text)
+        print(out_text, end='')
         return out_path
 
     _write_text_with_bom(out_path, out_text, had_bom)
@@ -391,6 +411,8 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help="Imprime el resultado en stdout sin escribir archivo.")
     parser.add_argument('--map-json', default=None, help="Guardar un JSON con el mapeo de traducciones.")
     parser.add_argument('--progress', action='store_true', help="Mostrar barra de progreso.")
+    parser.add_argument('--live-preview', dest='live_preview', action='store_true',
+                        help='Mostrar en vivo el resultado por segmento: en .srt imprime el bloque completo (index, tiempos y texto) y en .str imprime la linea key = "value".')
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -406,7 +428,8 @@ def main():
             api_key=args.api_key,
             force_format=args.format,
             save_map=args.map_json,
-            show_progress=args.progress
+            show_progress=args.progress,
+            show_preview=args.live_preview
         )
         if args.dry_run:
             print("\n--- fin (dry-run) ---")
