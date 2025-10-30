@@ -1,4 +1,4 @@
-# openai-str-translation-tool
+# openai-srt-translation-tool
 
 ## Prerequisites
 
