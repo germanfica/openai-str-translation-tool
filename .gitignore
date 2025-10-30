@@ -1,3 +1,5 @@
+*.srt
+
 # Snapshots
 snapshot_*.png
 
