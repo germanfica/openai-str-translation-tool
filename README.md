@@ -1,0 +1,1 @@
+# openai-str-translation-tool
