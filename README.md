@@ -11,3 +11,14 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 ```
+
+##
+
+```bash
+# export OPENAI_API_KEY="sk-...."      # linux / mac
+# o en Windows PowerShell:
+# setx OPENAI_API_KEY "sk-...."
+$env:OPENAI_API_KEY = "sk-...."
+
+python main.py "Hola, dame un ejemplo de un endpoint REST en Nodejs"
+```
