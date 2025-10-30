@@ -24,5 +24,5 @@ python main.py "Hola, dame un ejemplo de un endpoint REST en Nodejs"
 ```
 
 ```bash
-python str_translate.py ".\input.srt" --model "gpt-4o-mini"
+python srt_translate.py ".\input.srt" --model "gpt-4o-mini"
 ```
