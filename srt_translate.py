@@ -98,6 +98,29 @@ _TRANSLATOR_SYS_PROMPT = (
     "Usá español latino neutro, claro y natural."
 )
 
+_BATCH_SYS_PROMPT = (
+    "Sos un traductor EN->ES (español latino neutro). "
+    "Vas a recibir un array JSON de strings; cada string es un bloque completo de subtítulo. "
+    "Debés responder EXCLUSIVAMENTE con un array JSON de strings de la MISMA longitud. "
+    "Cada item traducido debe preservar exactamente la cantidad de renglones (\\n) y su orden respecto del item original. "
+    "Respetá exactamente los placeholders (por ej. __PH_0__, %s, {0}, $NAME$, etiquetas <b>...</b>, secuencias \\n). "
+    "No agregues ni quites espacios alrededor de placeholders ni cambies el número de elementos. "
+    "No incluyas texto adicional, ni bloques de código, ni comentarios. "
+    "Usá signos de apertura ¿ y ¡ cuando corresponda y español latino neutro, claro y natural."
+)
+
+def _strip_code_fences(s: str) -> str:
+    s = s.strip()
+    if s.startswith('```'):
+        # Intentar remover fences tipo ```json ... ```
+        s = s.strip('`')
+        # a veces el primer renglón es 'json' o 'JSON'
+        if '\n' in s:
+            first, rest = s.split('\n', 1)
+            if first.lower() in ('json', '```json'):
+                return rest.strip()
+    return s
+
 def translate_segment(client: OpenAI, model: str, text_en: str) -> str:
     frozen, mapping = freeze_placeholders(text_en)
     delay = 1.0
@@ -124,6 +147,56 @@ def translate_segment(client: OpenAI, model: str, text_en: str) -> str:
             time.sleep(delay)
             delay = min(delay * 2, 8.0)
     return text_en
+
+def translate_segments_batch(client: OpenAI, model: str, texts_en: List[str]) -> List[str]:
+    # Congela placeholders por item
+    frozens: List[str] = []
+    mappings: List[Dict[str, str]] = []
+    for t in texts_en:
+        f, m = freeze_placeholders(t)
+        frozens.append(f)
+        mappings.append(m)
+
+    payload = json.dumps(frozens, ensure_ascii=False)
+    delay = 1.0
+    for attempt in range(5):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": _BATCH_SYS_PROMPT},
+                    {"role": "user", "content": payload},
+                ],
+                temperature=0.2,
+                max_tokens=4096,
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            raw = _strip_code_fences(raw)
+            # a veces el modelo devuelve texto extra, tratamos de aislar el primer array
+            start = raw.find('[')
+            end = raw.rfind(']')
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError("respuesta sin JSON válido")
+            arr = json.loads(raw[start:end+1])
+            if not isinstance(arr, list) or len(arr) != len(frozens):
+                raise ValueError("longitud de array inválida")
+
+            # Descongelar y validar placeholders por item
+            out: List[str] = []
+            for orig, tr_frozen, mapping in zip(texts_en, arr, mappings):
+                tr = tr_frozen if isinstance(tr_frozen, str) else str(tr_frozen)
+                tr = unfreeze_placeholders(tr, mapping)
+                if not validate_placeholders(orig, tr):
+                    tr = orig
+                out.append(tr)
+            return out
+        except (RateLimitError, APIError, json.JSONDecodeError, ValueError):
+            if attempt == 4:
+                # fallback: item por item
+                return [translate_segment(client, model, t) for t in texts_en]
+            time.sleep(delay)
+            delay = min(delay * 2, 8.0)
+    return texts_en
 
 # helper: traducir un bloque completo preservando cantidad de saltos de línea
 def translate_block_preserving_newlines(client: OpenAI, model: str, lines: List[str]) -> List[str]:
@@ -308,13 +381,16 @@ def should_translate(line: str) -> bool:
     has_ascii_letters = re.search(r'[A-Za-z]', line) is not None
     return has_ascii_letters
 
+def _chunk_indices(idxs: List[int], batch_size: int) -> List[List[int]]:
+    return [idxs[i:i+batch_size] for i in range(0, len(idxs), max(1, batch_size))]
+
 def process_str_file(text: str, newline: str, client: OpenAI, model: str,
                      save_map: Optional[str], show_progress: bool,
-                     show_preview: bool = False) -> Tuple[str, List[Dict]]:
+                     show_preview: bool = False, batch_size: int = 1) -> Tuple[str, List[Dict]]:
     parsed = parse_str(text)
 
     # construir lista de segmentos a traducir
-    segments: List[Tuple[int, str]] = []  # (posicion en parsed, texto)
+    segments: List[Tuple[int, str]] = []
     for pos, (typ, obj) in enumerate(parsed):
         if typ == 'kv':
             val = obj.value.strip()
@@ -325,23 +401,44 @@ def process_str_file(text: str, newline: str, client: OpenAI, model: str,
     mapping_out: List[Dict] = []
     done = 0
 
-    for pos, src in segments:
-        tgt = translate_segment(client, model, src)
-        # reinyectar
-        typ, obj = parsed[pos]
-        assert typ == 'kv'
-        parsed[pos] = ('kv', KVLine(key=obj.key, value=tgt, trailing_comment=obj.trailing_comment))
-        mapping_out.append({'type': 'str', 'index_in_parsed': pos, 'source': src, 'translated': tgt})
-        done += 1
-        if show_progress:
-            print_progress(done, total)
-
-        if show_preview:
-            v_escaped = tgt.replace('"', '\\"')
-            preview_line = f'{obj.key} = "{v_escaped}"'
-            if obj.trailing_comment:
-                preview_line += ' ' + obj.trailing_comment
-            print(preview_line, flush=True)
+    if batch_size <= 1:
+        for pos, src in segments:
+            tgt = translate_segment(client, model, src)
+            typ, obj = parsed[pos]
+            assert typ == 'kv'
+            parsed[pos] = ('kv', KVLine(key=obj.key, value=tgt, trailing_comment=obj.trailing_comment))
+            mapping_out.append({'type': 'str', 'index_in_parsed': pos, 'source': src, 'translated': tgt})
+            done += 1
+            if show_progress:
+                print_progress(done, total)
+            if show_preview:
+                v_escaped = tgt.replace('"', '\\"')
+                preview_line = f'{obj.key} = "{v_escaped}"'
+                if obj.trailing_comment:
+                    preview_line += ' ' + obj.trailing_comment
+                print(preview_line, flush=True)
+    else:
+        # procesar en lotes de claves/valores
+        positions = [pos for pos, _ in segments]
+        texts_en = [src for _, src in segments]
+        for chunk_start in range(0, len(texts_en), batch_size):
+            chunk_positions = positions[chunk_start:chunk_start+batch_size]
+            chunk_texts = texts_en[chunk_start:chunk_start+batch_size]
+            chunk_translated = translate_segments_batch(client, model, chunk_texts)
+            for pos, src, tgt in zip(chunk_positions, chunk_texts, chunk_translated):
+                typ, obj = parsed[pos]
+                assert typ == 'kv'
+                parsed[pos] = ('kv', KVLine(key=obj.key, value=tgt, trailing_comment=obj.trailing_comment))
+                mapping_out.append({'type': 'str', 'index_in_parsed': pos, 'source': src, 'translated': tgt})
+                done += 1
+                if show_progress:
+                    print_progress(done, total)
+                if show_preview:
+                    v_escaped = tgt.replace('"', '\\"')
+                    preview_line = f'{obj.key} = "{v_escaped}"'
+                    if obj.trailing_comment:
+                        preview_line += ' ' + obj.trailing_comment
+                    print(preview_line, flush=True)
 
     if save_map:
         with open(save_map, 'w', encoding='utf-8') as f:
@@ -351,7 +448,7 @@ def process_str_file(text: str, newline: str, client: OpenAI, model: str,
 
 def process_srt_file(text: str, newline: str, client: OpenAI, model: str,
                      save_map: Optional[str], show_progress: bool,
-                     show_preview: bool = False) -> Tuple[str, List[Dict]]:
+                     show_preview: bool = False, batch_size: int = 1) -> Tuple[str, List[Dict]]:
     blocks = parse_srt(text)
 
     # primero contamos cuantos bloques requieren traducción para la barra
@@ -364,36 +461,67 @@ def process_srt_file(text: str, newline: str, client: OpenAI, model: str,
     mapping_out: List[Dict] = []
     done = 0
 
-    for bi in translatable_block_idxs:
-        b = blocks[bi]
-
-        # intento 1: traducir el bloque completo preservando saltos
-        try_block = translate_block_preserving_newlines(client, model, b.text_lines)
-        if len(try_block) == len(b.text_lines):
-            new_lines = try_block
-        else:
-            # fallback: línea por línea solo donde haga falta
-            new_lines = []
-            for li, src in enumerate(b.text_lines):
-                if src.strip() and should_translate(src):
-                    new_lines.append(translate_segment(client, model, src))
-                else:
-                    new_lines.append(src)
-
-        # guardar mapping por línea
-        for li, (src, tgt) in enumerate(zip(b.text_lines, new_lines)):
-            mapping_out.append({'type': 'srt', 'block': bi, 'line': li, 'source': src, 'translated': tgt})
-
-        # reinyectar
-        blocks[bi].text_lines = new_lines
-
-        done += 1
-        if show_progress:
-            print_progress(done, total)
-
-        if show_preview:
-            preview_text = _render_srt_block(blocks[bi], newline)
-            print(preview_text, end='', flush=True)
+    if batch_size <= 1:
+        # bloque a bloque como antes
+        for bi in translatable_block_idxs:
+            b = blocks[bi]
+            try_block = translate_block_preserving_newlines(client, model, b.text_lines)
+            if len(try_block) == len(b.text_lines):
+                new_lines = try_block
+            else:
+                new_lines = []
+                for src in b.text_lines:
+                    if src.strip() and should_translate(src):
+                        new_lines.append(translate_segment(client, model, src))
+                    else:
+                        new_lines.append(src)
+            for li, (src, tgt) in enumerate(zip(b.text_lines, new_lines)):
+                mapping_out.append({'type': 'srt', 'block': bi, 'line': li, 'source': src, 'translated': tgt})
+            blocks[bi].text_lines = new_lines
+            done += 1
+            if show_progress:
+                print_progress(done, total)
+            if show_preview:
+                preview_text = _render_srt_block(blocks[bi], newline)
+                print(preview_text, end='', flush=True)
+    else:
+        # batch por bloques: cada item del batch es un bloque completo
+        idx_chunks = _chunk_indices(translatable_block_idxs, batch_size)
+        for chunk in idx_chunks:
+            originals: List[str] = []
+            for bi in chunk:
+                b = blocks[bi]
+                originals.append('\n'.join(b.text_lines))
+            translated_blocks = translate_segments_batch(client, model, originals)
+            # validar y, si falla la cantidad de líneas, fallback por bloque
+            for bi, orig_joined, tr_joined in zip(chunk, originals, translated_blocks):
+                orig_lines = orig_joined.split('\n')
+                tr_lines = tr_joined.split('\n')
+                if len(tr_lines) != len(orig_lines):
+                    # fallback por bloque completo
+                    b = blocks[bi]
+                    try_block = translate_block_preserving_newlines(client, model, b.text_lines)
+                    if len(try_block) == len(b.text_lines):
+                        tr_lines = try_block
+                    else:
+                        # fallback final línea por línea
+                        tr_lines = []
+                        for src in b.text_lines:
+                            if src.strip() and should_translate(src):
+                                tr_lines.append(translate_segment(client, model, src))
+                            else:
+                                tr_lines.append(src)
+                # mapping y reinyectar
+                b = blocks[bi]
+                for li, (src, tgt) in enumerate(zip(b.text_lines, tr_lines)):
+                    mapping_out.append({'type': 'srt', 'block': bi, 'line': li, 'source': src, 'translated': tgt})
+                blocks[bi].text_lines = tr_lines
+                done += 1
+                if show_progress:
+                    print_progress(done, total)
+                if show_preview:
+                    preview_text = _render_srt_block(blocks[bi], newline)
+                    print(preview_text, end='', flush=True)
 
     if save_map:
         with open(save_map, 'w', encoding='utf-8') as f:
@@ -403,7 +531,7 @@ def process_srt_file(text: str, newline: str, client: OpenAI, model: str,
 
 def process_file(in_path: str, out_suffix: str, dry_run: bool, model: str, api_key: Optional[str],
                  force_format: str, save_map: Optional[str], show_progress: bool,
-                 show_preview: bool) -> str:
+                 show_preview: bool, batch_size: int) -> str:
     text, had_bom, newline = _read_text_keep_bom(in_path)
     fmt = detect_format(text) if force_format == 'auto' else force_format.lower()
     client = get_client(api_key)
@@ -412,10 +540,14 @@ def process_file(in_path: str, out_suffix: str, dry_run: bool, model: str, api_k
         raise ValueError("Formato inválido. Usá --format auto|str|srt")
 
     if fmt == 'srt' or (fmt == 'auto' and detect_format(text) == 'srt'):
-        out_text, _ = process_srt_file(text, newline, client, model, save_map, show_progress, show_preview)
+        out_text, _ = process_srt_file(
+            text, newline, client, model, save_map, show_progress, show_preview, batch_size
+        )
         out_path = _derive_out_path(in_path, out_suffix, forced_ext='.srt')
     else:
-        out_text, _ = process_str_file(text, newline, client, model, save_map, show_progress, show_preview)
+        out_text, _ = process_str_file(
+            text, newline, client, model, save_map, show_progress, show_preview, batch_size
+        )
         out_path = _derive_out_path(in_path, out_suffix, forced_ext=None)
 
     if dry_run:
@@ -442,6 +574,9 @@ def main():
     parser.add_argument('--progress', action='store_true', help="Mostrar barra de progreso.")
     parser.add_argument('--live-preview', dest='live_preview', action='store_true',
                         help='Mostrar en vivo el resultado por segmento: en .srt imprime el bloque completo (index, tiempos y texto) y en .str imprime la linea key = "value".')
+    parser.add_argument('--batch-size', type=int, default=1,
+                        help='Cantidad de items por request. En SRT, cada item es 1 bloque (default: 1).')
+
     args = parser.parse_args()
 
     if not os.path.isfile(args.input):
@@ -458,7 +593,8 @@ def main():
             force_format=args.format,
             save_map=args.map_json,
             show_progress=args.progress,
-            show_preview=args.live_preview
+            show_preview=args.live_preview,
+            batch_size=max(1, args.batch_size)
         )
         if args.dry_run:
             print("\n--- fin (dry-run) ---")
