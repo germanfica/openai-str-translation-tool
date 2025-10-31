@@ -10,6 +10,10 @@ import argparse
 from dataclasses import dataclass
 from typing import List, Tuple, Dict, Optional, Union
 from openai import OpenAI, APIError, RateLimitError  # pip install openai>=1.0.0
+from cost_report import estimate_operation_cost, render_cost_summary
+
+total_prompt_tokens = 0
+total_completion_tokens = 0
 
 # ====================== Utils: archivo y BOM ======================
 
@@ -121,6 +125,42 @@ def _strip_code_fences(s: str) -> str:
                 return rest.strip()
     return s
 
+def _add_usage_from_response(resp) -> None:
+    """
+    Extrae prompt_tokens y completion_tokens de la respuesta 'resp' de forma tolerante
+    y los suma a los acumuladores globales.
+    """
+    global total_prompt_tokens, total_completion_tokens
+    try:
+        usage = None
+        # varios SDKs/formatos: puede ser atributo o dict
+        if hasattr(resp, "usage"):
+            usage = resp.usage
+        elif isinstance(resp, dict):
+            usage = resp.get("usage")
+        # si no hay usage, salir
+        if not usage:
+            return
+        # obtener valores de forma tolerante (attr o key)
+        def _get(u, key):
+            if hasattr(u, key):
+                return getattr(u, key)
+            if isinstance(u, dict):
+                return u.get(key)
+            return None
+
+        p = _get(usage, "prompt_tokens")
+        c = _get(usage, "completion_tokens")
+        # fallback: algunos SDKs usan 'total_tokens' o nombres distintos; no lo tomamos aquí
+        p = int(p) if p is not None else 0
+        c = int(c) if c is not None else 0
+
+        total_prompt_tokens += p
+        total_completion_tokens += c
+    except Exception:
+        # Nunca queremos que fallos en extracción rompan la traducción.
+        return
+
 def translate_segment(client: OpenAI, model: str, text_en: str) -> str:
     frozen, mapping = freeze_placeholders(text_en)
     delay = 1.0
@@ -135,6 +175,9 @@ def translate_segment(client: OpenAI, model: str, text_en: str) -> str:
                 temperature=0.2,
                 max_tokens=800,
             )
+            # intentar acumular usage (si lo tiene)
+            _add_usage_from_response(resp)
+
             out = (resp.choices[0].message.content or "").strip()
             out_unfrozen = unfreeze_placeholders(out, mapping)
             if not validate_placeholders(text_en, out_unfrozen):
@@ -170,6 +213,10 @@ def translate_segments_batch(client: OpenAI, model: str, texts_en: List[str]) ->
                 temperature=0.2,
                 max_tokens=4096,
             )
+
+            # acumular usage de la llamada batch (si existe)
+            _add_usage_from_response(resp)
+
             raw = (resp.choices[0].message.content or "").strip()
             raw = _strip_code_fences(raw)
             # a veces el modelo devuelve texto extra, tratamos de aislar el primer array
@@ -602,6 +649,26 @@ def main():
             print(f"OK: guardado '{out_path}'")
             if args.map_json:
                 print(f"OK: mapeo guardado en '{args.map_json}'")
+        # Reporte de costos
+        print("REPORTE:")
+        # ahora total_prompt_tokens y total_completion_tokens ya existen y fueron actualizados
+        if (total_prompt_tokens + total_completion_tokens) > 0:
+            details = estimate_operation_cost(
+                model=args.model,
+                prompt_tokens=total_prompt_tokens,
+                completion_tokens=total_completion_tokens,
+                cached_input_tokens=0,                    # si usaste cache input, ponelo acá
+                preferred_section="Text tokens",          # o el que corresponda
+                preferred_tier="Standard",                # Standard / Batch / Flex / Priority
+                pricing_json_path="openai_pricing.json",  # usa JSON si lo tenés
+                pricing_md_path="openai_pricing.md",      # fallback a MD si no hay JSON
+            )
+            print("\n=== Costo estimado ===")
+            print(render_cost_summary(details))
+        else:
+            print("No se registraron tokens (0).")
+
+        #estimate_operation_cost(args.input, out_path, args.map_json, args.model)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(2)
