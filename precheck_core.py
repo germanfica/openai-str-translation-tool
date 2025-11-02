@@ -152,6 +152,9 @@ def _ask_confirmation(default_no: bool = True) -> bool:
         ans = input(prompt).strip()
     except EOFError:
         ans = ""
+    except KeyboardInterrupt:
+        print(f"\n{RED}Cancelado por el usuario.{RESET}", file=sys.stderr)
+        sys.exit(130)
     if default_no:
         return ans.lower() == "y"
     else:
