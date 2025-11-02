@@ -9,6 +9,7 @@ import argparse
 
 from translate_core import run_translation
 from precheck_core import run_cost_precheck_for_core
+from cli_colors import RED, YELLOW, GREEN, CYAN, RESET
 
 def main():
     parser = argparse.ArgumentParser(
@@ -78,6 +79,13 @@ def main():
     except SystemExit:
         # Si el precheck llamó a sys.exit(130) o similar, respetamos ese comportamiento
         raise
+    except KeyboardInterrupt:
+        # Ctrl + C en cualquier momento
+        try:
+            print(f"\n{RED}Cancelado por el usuario.{RESET}", file=sys.stderr)
+        except Exception:
+            print("\nCancelado por el usuario.", file=sys.stderr)
+        sys.exit(130)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(2)
