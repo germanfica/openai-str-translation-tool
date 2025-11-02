@@ -1,3 +1,4 @@
+# precheck_core.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -48,21 +49,8 @@ from translate_core import (
 # Tu reporte/catálogo local de precios
 from cost_report import estimate_operation_cost
 
-# ===== Colores (colorama si está; fallback ANSI) =====
-try:
-    from colorama import init as colorama_init, Fore, Style
-    colorama_init()
-    RED = Fore.RED
-    YELLOW = Fore.YELLOW
-    GREEN = Fore.GREEN
-    CYAN = Fore.CYAN
-    RESET = Style.RESET_ALL
-except Exception:
-    RED = "\033[31m"
-    YELLOW = "\033[33m"
-    GREEN = "\033[32m"
-    CYAN = "\033[36m"
-    RESET = "\033[0m"
+# Colores compartidos
+from cli_colors import RED, YELLOW, GREEN, CYAN, RESET
 
 # ===== Tokenizador (tiktoken opcional; si no, heurística 1 token ~ 4 chars) =====
 def _choose_encoding_name(model: str) -> str:
