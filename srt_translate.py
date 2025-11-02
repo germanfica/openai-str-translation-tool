@@ -8,6 +8,7 @@ import sys
 import argparse
 
 from translate_core import run_translation
+from precheck_core import run_cost_precheck_for_core
 
 def main():
     parser = argparse.ArgumentParser(
@@ -35,6 +36,24 @@ def main():
         sys.exit(1)
 
     try:
+        # ===================== PRECHECK (inicio) =====================
+        # Muestra WARNING con estimación de costo basada SOLO en lo que se enviará al LLM
+        # y pide confirmación y/N. Si el usuario cancela, run_cost_precheck_for_core debe hacer sys.exit(130).
+        precheck_summary = run_cost_precheck_for_core(
+            in_path=args.input,
+            model=args.model,
+            fmt_forced=args.format,               # 'auto'|'str'|'srt'
+            batch_size=max(1, args.batch_size),
+            completion_multiplier=1.0,            # asume salida ≈ entrada (ajustar si corresponde)
+            section='Text tokens',
+            tier='Standard',
+            pricing_json_path='openai_pricing.json',
+            pricing_md_path='openai_pricing.md',
+            assume_yes=False                      # siempre preguntar en este script
+        )
+        # opcional: podés loguear precheck_summary si necesitas
+
+        # ===================== TRADUCCIÓN =====================
         out_path = run_translation(
             in_path=args.input,
             out_suffix=args.suffix,
@@ -56,6 +75,9 @@ def main():
             if args.map_json:
                 print(f"OK: mapeo guardado en '{args.map_json}'")
 
+    except SystemExit:
+        # Si el precheck llamó a sys.exit(130) o similar, respetamos ese comportamiento
+        raise
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(2)
